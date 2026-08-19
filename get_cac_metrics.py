@@ -202,8 +202,8 @@ def convert_to_json(csv_file):
     # but unlike os.system it does not block SIGINT in this process, so Ctrl-C
     # actually stops the run instead of falling through to a false "Done!".
     try:
-        completed = sp.run(["unified-csv-tojson", str(csv_file), ".", str(stem)], shell=True,
-                           check=False)
+        completed = sp.run(["unified-csv-tojson", str(csv_file), ".", str(stem)],
+                   capture_output=True, text=True)   # keep whatever kwargs you had
     except KeyboardInterrupt:
         note(f"{YELLOW}  interrupted after "
              f"{elapsed(time.monotonic() - started)} — conversion incomplete{RESET}")
