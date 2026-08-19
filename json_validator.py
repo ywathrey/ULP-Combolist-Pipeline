@@ -1,6 +1,8 @@
 '''
 Out-of-core validator for the CAC JSON files, using DuckDB.
 
+Why DuckDB: the pandas version held a growing email set in RAM, which on a
+30 GB machine blew into 40+ GB of swap and got OOM-killed near the end.
 DuckDB streams the files, does the heavy aggregates (incl. exact
 COUNT(DISTINCT email)) in C, and SPILLS to disk when it exceeds the memory
 limit you set -- so it finishes instead of thrashing.
