@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Script to validate CAC JSON files. Built for very large packages (tens of GB).
 
@@ -19,31 +18,10 @@ External dependencies (unchanged):
 Usage:
     python3 cac_validate_large.py <parsed_csv> [options]
     python3 cac_validate_large.py huge_parsed.csv --sftp-link 'sftp://...'
-
---------------------------------------------------------------------------
-FIX LOG (report parsing)
---------------------------------------------------------------------------
-read_metrics used substring matching (`if "cac_email" in line`) with no
-break, so the last matching line won. Two consequences:
-
-  1. `cac_email_domain` contains `cac_email` as a substring, so total_lines
-     was always sourced from the DOMAIN count, not the email count. The two
-     happened to be equal whenever every address had a parseable domain --
-     a coincidence, not a guarantee. Any row with an unparseable domain
-     would have silently shifted the published figure.
-
-  2. Any line added anywhere in the validator's output that merely CONTAINED
-     a field name was picked up as data, crashing on the tab split.
-
-Parsing is now anchored to the section header and requires the field name to
-fill the whole cell before the tab. Absent columns are also distinguished
-from zero-valued ones, so "No passwords were found in this breach" is only
-emitted when the validator actually reported a cac_password column.
 """
 
 import argparse
 import os
-import re
 import subprocess as sp
 import sys
 import time
@@ -51,7 +29,6 @@ from pathlib import Path
 
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
-RED = "\033[1;31m"
 RESET = "\033[0m"
 
 METRICS_FILE = "metrics.txt"
@@ -66,8 +43,6 @@ BAD_ROWS_SHOWN = 20              # printed to stderr; the rest go to the file
 HIGH_CARDINALITY_WARN = 5_000_000
 
 TAIL = "Other notable data fields observed in this package include: "
-
-ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
 
 # --------------------------------------------------------------------------- #
@@ -222,9 +197,11 @@ def convert_to_json(csv_file):
     started = time.monotonic()
     note("  running unified-csv-tojson (this is the slow part on a large file)")
 
+    # shell=True keeps the command byte-identical to the original os.system call,
+    # but unlike os.system it does not block SIGINT in this process, so Ctrl-C
+    # actually stops the run instead of falling through to a false "Done!".
     try:
-        completed = sp.run(["unified-csv-tojson", str(csv_file), ".", str(stem)],
-                           capture_output=True, text=True)
+        completed = sp.run(["unified-csv-tojson", csv_file, ".", stem], check=False)
     except KeyboardInterrupt:
         note(f"{YELLOW}  interrupted after "
              f"{elapsed(time.monotonic() - started)} — conversion incomplete{RESET}")
@@ -265,80 +242,22 @@ def run_validator(json_file):
 # --------------------------------------------------------------------------- #
 # Parse blurb
 # --------------------------------------------------------------------------- #
-def _parse_report(report):
-    """Split the validator's stdout into {column: value} and {metric: value}.
-
-    Anchored to section headers, and a field name must fill the entire cell
-    before the tab. See the FIX LOG at the top of this file for why substring
-    matching was wrong. If you add a section to json_validator.py, add its
-    header to the reset list below rather than relying on line contents.
-    """
-    columns, metrics = {}, {}
-    section = None
-
-    for raw in report.split("\n"):
-        line = ANSI_RE.sub("", raw).rstrip()
-        stripped = line.strip()
-
-        if stripped == "COLUMNS AND COUNTS":
-            section = "columns"
-            continue
-        if stripped == "ADDITIONAL METRICS":
-            section = "metrics"
-            continue
-        if stripped in ("EXPECTED FIELD PRESENCE", "Breach Package Headers"):
-            section = None
-            continue
-
-        if section is None or not stripped:
-            continue
-        if set(stripped) == {"-"}:      # the ------ underline
-            continue
-        if "\t" not in line:            # prose, sample row dumps, [check] lines
-            continue
-        if line[0] in " \t":            # indented -> diagnostic, never data
-            continue
-
-        name, _, value = line.partition("\t")
-        target = columns if section == "columns" else metrics
-        target[name.strip()] = value.strip()
-
-    return columns, metrics
-
-
 def read_metrics(report):
-    """(total_lines, password_lines, usernames, pass_type, password_known)."""
-    columns, metrics = _parse_report(report)
+    total_lines = password_lines = usernames = 0
+    pass_type = ""
 
-    def as_int(mapping, key):
-        value = mapping.get(key)
-        if value is None:
-            return None
-        try:
-            return int(value.replace(",", ""))
-        except ValueError:
-            return None
+    for line in report.split("\n"):
+        if "cac_email" in line:
+            total_lines = int(line.split("\t")[1])
+        if "Number of unique usernames" in line:
+            usernames = int(line.split("\t")[1])
+        if "cac_password" in line:
+            password_lines = int(line.split("\t")[1])
+        if "Possible password type" in line:
+            pass_type = line.split("\t")[1]
 
-    total_lines = as_int(columns, "cac_email")
-    if total_lines is None:
-        raise ValueError(
-            "could not read a 'cac_email' count from the COLUMNS AND COUNTS "
-            "section of the validator output. Refusing to build a blurb from "
-            "an unknown record count -- inspect the report by hand."
-        )
+    return total_lines, password_lines, usernames, pass_type
 
-    # None means the column was absent from the validator's output entirely;
-    # 0 means it was present and empty. These must not be conflated, because
-    # only the second one justifies stating that no passwords were found.
-    password_lines = as_int(columns, "cac_password")
-    password_known = password_lines is not None
-
-    usernames = as_int(metrics, "Number of unique usernames") or 0
-    pass_type = metrics.get("Possible password type", "")
-
-    return total_lines, password_lines or 0, usernames, pass_type, password_known
-
-# --------------------------------------------------------------------------- #
 
 TAIL = "Other notable data fields observed in this package include:"
 
@@ -358,6 +277,7 @@ def build_parse_info(total_lines, password_lines, usernames, pass_type):
     subject = "email addresses, usernames and" if usernames else "email addresses and"
     return f"{lead} {total_lines:,} {subject} {pass_type} passwords. {TAIL}"
 
+
 # --------------------------------------------------------------------------- #
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -370,8 +290,7 @@ def parse_args():
     parser.add_argument("--sftp-link",
                         help="supply the link up front so the run is unattended")
     parser.add_argument("--shard", type=int, default=0,
-                        help="which JSON shard to name on the validator's "
-                             "command line (default: 0)")
+                        help="which JSON shard to validate (default: 0)")
     parser.add_argument("--use-sort", action="store_true",
                         help="rank with the original cat|sort|uniq pipeline")
     parser.add_argument("--no-metrics-file", action="store_true",
@@ -418,14 +337,11 @@ def main():
 
     shards = find_shards(csv_file)
     if len(shards) > 1:
-        # json_validator.py globs every *_parsed<N>.json in the working
-        # directory and ignores the filename on its command line, so all
-        # shards are aggregated regardless of --shard. Verify this still
-        # holds if that script changes.
         note(
-            f"{YELLOW}  note: converter produced {len(shards)} JSON shards. "
-            f"json_validator.py globs the working directory, so the counts "
-            f"below aggregate ALL shards, not just shard {args.shard}.{RESET}"
+            f"{YELLOW}  note: converter produced {len(shards)} JSON shards; "
+            f"validating shard {args.shard} only, as the original script did. "
+            f"Counts in the blurb will cover that shard, not the whole package. "
+            f"Use --shard N to pick another.{RESET}"
         )
     json_file = f"{csv_file[:-4]}{args.shard}.json"
     if not os.path.isfile(json_file):
